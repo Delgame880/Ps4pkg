@@ -80,13 +80,21 @@ The library path can also be changed from the Settings page. It must be a path t
 
 ### Reading the terminal logs
 
-The server logs every connection test and install request with a timestamp, target host/port, endpoint, HTTP status, response body, duration, and network error code. Set `LOG_LEVEL=debug` while troubleshooting:
+The server logs every connection test and install request with a timestamp, target host/port, endpoint, HTTP status, response body, duration, and network error code. It also logs package-server requests made by the PS4. Set `LOG_LEVEL=debug` while troubleshooting:
 
 ```sh
 docker compose logs -f pkg-link
 ```
 
-Look for `PS4 request failed` with codes such as `ECONNREFUSED`, `ETIMEDOUT`, or `ENOTFOUND`. For an install, also verify that the logged `packageUrls` use the Docker host's LAN address and not `localhost` or a Docker-only address.
+For an RPI timeout, use these entries to identify the failing hop:
+
+- `PS4 TCP connection established` means the Docker container completed TCP connection to the configured PS4 address and port. `tcpConnected: false` in a timeout means it failed before the RPI socket connected; `lookupAddress` and `lookupError` show DNS details.
+- `PS4 request body sent` means the JSON body and declared `Content-Length` were flushed to the socket. If it is true while `responseHeadersReceived` is false, the request left PKG Link and is waiting on RPI.
+- `PS4 response headers received` means RPI answered. If it is absent but `tcpConnected: true`, the connection reached RPI and RPI is still preparing the request or is stuck.
+- `Package request received` and `Package response started` mean the PS4 reached the public package URL. If neither appears during `/api/install`, check `PUBLIC_BASE_URL`, Docker port publishing, host firewall rules, and PS4-to-host routing. If they appear with a 404/416 or an early close, the package URL or range response needs attention.
+- `PS4 response received` includes the HTTP status and JSON body after RPI finishes.
+
+Look for `PS4 request failed` with codes such as `ECONNREFUSED`, `ETIMEDOUT`, or `ENOTFOUND`. For an install, also verify that the logged `packageUrls` use the Docker host's LAN address and not `localhost` or a Docker-only address. The connection-test button calls `/api/is_exists`, so use it first to separate an RPI listener/port problem from package-host reachability.
 
 ## How scanning works
 

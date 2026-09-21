@@ -64,6 +64,9 @@ test('settings are clamped and public URLs are normalized', () => {
   assert.equal(settings.scanIntervalSec, 5);
   assert.equal(settings.ps4Port, 65535);
   assert.equal(settings.publicBaseUrl, 'http://192.168.1.10:8080');
+  const defaults = sanitizeConfig({ libraryPath: '/pkg' });
+  assert.equal(defaults.ps4Port, 12801);
+  assert.equal(defaults.requestTimeoutSec, 60);
   assert.equal(normalizeBaseUrl('', true), '');
   assert.throws(() => normalizeBaseUrl('ftp://nas.local/pkg'), /http or https/);
 });

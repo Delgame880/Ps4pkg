@@ -422,6 +422,49 @@ function requestPs4(method, requestPath, payload, connectionOverrides = {}) {
   });
 
   return new Promise((resolve, reject) => {
+    const state = {
+      socketAssignedAt: null,
+      lookupAt: null,
+      lookupAddress: null,
+      lookupFamily: null,
+      lookupError: null,
+      tcpConnectedAt: null,
+      requestFinishedAt: null,
+      responseHeadersAt: null,
+      responseEndedAt: null,
+    };
+
+    function phase(errorCode) {
+      if (state.responseEndedAt) return 'complete';
+      if (state.responseHeadersAt) return 'response-body';
+      if (state.tcpConnectedAt) return 'waiting-for-rpi-response';
+      if (errorCode === 'ENOTFOUND' || state.lookupError) return 'dns';
+      return 'tcp-connect';
+    }
+
+    function diagnostics(errorCode) {
+      return {
+        phase: phase(errorCode),
+        socketAssigned: Boolean(state.socketAssignedAt),
+        tcpConnected: Boolean(state.tcpConnectedAt),
+        requestBodySent: Boolean(state.requestFinishedAt),
+        responseHeadersReceived: Boolean(state.responseHeadersAt),
+        dnsLookupCompleted: Boolean(state.lookupAt),
+        lookupAddress: state.lookupAddress,
+        lookupFamily: state.lookupFamily,
+        lookupError: state.lookupError,
+        durationMs: Date.now() - requestStartedAt,
+      };
+    }
+
+    function enrichError(error) {
+      const detail = diagnostics(error.code);
+      error.phase = detail.phase;
+      error.target = target;
+      error.diagnostics = detail;
+      return error;
+    }
+
     const request = transport.request({
       protocol: address.protocol,
       hostname: address.hostname,
@@ -433,13 +476,32 @@ function requestPs4(method, requestPath, payload, connectionOverrides = {}) {
       agent: false,
       rejectUnauthorized: false,
     }, (response) => {
+      state.responseHeadersAt = Date.now();
+      log(logLevel, 'PS4 response headers received', {
+        method,
+        target,
+        statusCode: response.statusCode || 0,
+        durationMs: Date.now() - requestStartedAt,
+        diagnostics: diagnostics(),
+        headers: response.headers,
+      });
+
       const chunks = [];
       let length = 0;
       response.on('data', (chunk) => {
         length += chunk.length;
         if (length <= 5 * 1024 * 1024) chunks.push(chunk);
       });
+      response.on('aborted', () => {
+        log('warn', 'PS4 response aborted before completion', {
+          method,
+          target,
+          durationMs: Date.now() - requestStartedAt,
+          diagnostics: diagnostics(),
+        });
+      });
       response.on('end', () => {
+        state.responseEndedAt = Date.now();
         const raw = Buffer.concat(chunks).toString('utf8');
         let parsed = {};
         let parseError = null;
@@ -457,24 +519,98 @@ function requestPs4(method, requestPath, payload, connectionOverrides = {}) {
           target,
           statusCode,
           durationMs: Date.now() - requestStartedAt,
+          diagnostics: diagnostics(),
           response: parsed,
           ...(parseError ? { parseError } : {}),
         });
-        resolve({ statusCode, body: parsed, raw });
+        resolve({ statusCode, body: parsed, raw, diagnostics: diagnostics() });
+      });
+    });
+
+    request.on('socket', (socket) => {
+      state.socketAssignedAt = Date.now();
+      log('debug', 'PS4 socket assigned', {
+        method,
+        target,
+        reused: Boolean(request.reusedSocket),
+        diagnostics: diagnostics(),
+      });
+      socket.once('lookup', (error, addressValue, family) => {
+        state.lookupAt = Date.now();
+        state.lookupAddress = addressValue || null;
+        state.lookupFamily = family || null;
+        state.lookupError = error ? error.code || error.message : null;
+        log(error ? 'warn' : 'debug', 'PS4 DNS lookup completed', {
+          method,
+          target,
+          address: state.lookupAddress,
+          family: state.lookupFamily,
+          code: state.lookupError,
+          diagnostics: diagnostics(error && error.code),
+        });
+      });
+      socket.once('connect', () => {
+        state.tcpConnectedAt = Date.now();
+        log('debug', 'PS4 TCP connection established', {
+          method,
+          target,
+          durationMs: Date.now() - requestStartedAt,
+          diagnostics: diagnostics(),
+        });
+      });
+      socket.once('secureConnect', () => {
+        if (!state.tcpConnectedAt) state.tcpConnectedAt = Date.now();
+        log('debug', 'PS4 TLS connection established', {
+          method,
+          target,
+          durationMs: Date.now() - requestStartedAt,
+          diagnostics: diagnostics(),
+        });
+      });
+      socket.once('close', (hadError) => {
+        log('debug', 'PS4 socket closed', {
+          method,
+          target,
+          hadError,
+          diagnostics: diagnostics(),
+        });
+      });
+    });
+
+    request.on('finish', () => {
+      state.requestFinishedAt = Date.now();
+      log('debug', 'PS4 request body sent', {
+        method,
+        target,
+        bodyBytes: bodyLength,
+        durationMs: Date.now() - requestStartedAt,
+        diagnostics: diagnostics(),
       });
     });
     request.on('timeout', () => {
-      const error = new Error(`PS4 request timed out after ${config.requestTimeoutSec} seconds.`);
+      const error = enrichError(new Error(`PS4 request timed out after ${config.requestTimeoutSec} seconds.`));
       error.code = 'ETIMEDOUT';
-      log('error', 'PS4 request timed out', { method, target, durationMs: Date.now() - requestStartedAt, code: error.code });
+      // Re-enrich after assigning the code so DNS/connect phases remain useful
+      // for the final timeout and error log entries.
+      enrichError(error);
+      log('error', 'PS4 request timed out', {
+        method,
+        target,
+        code: error.code,
+        durationMs: Date.now() - requestStartedAt,
+        diagnostics: error.diagnostics,
+      });
       request.destroy(error);
     });
     request.on('error', (error) => {
+      enrichError(error);
       log('error', 'PS4 request failed', {
         method,
         target,
         durationMs: Date.now() - requestStartedAt,
         code: error.code,
+        phase: error.phase,
+        diagnostics: error.diagnostics,
         error: error.message,
       });
       reject(error);
@@ -640,7 +776,14 @@ function queueTransferProcessing(request) {
   log('info', 'Transfer worker picked up task', { transferId: next.id, fileName: next.fileName });
   runTransfer(next, request)
     .catch((error) => {
-      log('error', 'PS4 package transfer failed', { transferId: next.id, fileName: next.fileName, code: error.code, error: error.message });
+      log('error', 'PS4 package transfer failed', {
+        transferId: next.id,
+        fileName: next.fileName,
+        code: error.code,
+        phase: error.phase,
+        diagnostics: error.diagnostics,
+        error: error.message,
+      });
       if (next.status !== 'cancelled') {
         next.status = 'failed';
         next.phase = 'Failed';
@@ -701,53 +844,102 @@ function parseRange(rangeHeader, size) {
 }
 
 async function servePackage(request, response, id) {
+  const startedAt = Date.now();
+  let responseFinished = false;
+  let responseContentLength = null;
+  const remoteAddress = request.socket && request.socket.remoteAddress ? request.socket.remoteAddress : null;
+  const requestDetails = {
+    method: request.method,
+    id,
+    remoteAddress,
+    remotePort: request.socket && request.socket.remotePort ? request.socket.remotePort : null,
+    range: request.headers.range || null,
+    userAgent: request.headers['user-agent'] || null,
+  };
+
+  log('info', 'Package request received', requestDetails);
+  response.once('finish', () => {
+    responseFinished = true;
+    log('info', 'Package response completed', {
+      ...requestDetails,
+      statusCode: response.statusCode || 0,
+      contentLength: responseContentLength,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+  response.once('close', () => {
+    if (!responseFinished) {
+      log('warn', 'Package response closed before completion', {
+        ...requestDetails,
+        statusCode: response.statusCode || 0,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+  });
+
   let packagePath;
+  let relativePath;
   try {
-    packagePath = pathForId(id).absolute;
-  } catch {
+    ({ absolute: packagePath, relativePath } = pathForId(id));
+  } catch (error) {
+    log('warn', 'Package request rejected', { ...requestDetails, reason: 'invalid package id', error: error.message });
     response.writeHead(404);
     response.end('Package not found');
     return;
   }
 
+  const packageDetails = { ...requestDetails, relativePath };
   let stat;
   try {
     stat = await fsp.stat(packagePath);
     if (!stat.isFile() || !packagePath.toLowerCase().endsWith('.pkg')) throw new Error('not a package');
-  } catch {
+  } catch (error) {
+    log('warn', 'Package request could not find file', { ...packageDetails, reason: error.message });
     response.writeHead(404);
     response.end('Package not found');
     return;
   }
 
+  requestDetails.relativePath = relativePath;
   const range = parseRange(request.headers.range, stat.size);
   if (range && range.invalid) {
+    log('warn', 'Package request has invalid range', { ...packageDetails, size: stat.size });
     response.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
     response.end();
     return;
   }
   const start = range ? range.start : 0;
   const end = range ? range.end : stat.size - 1;
+  responseContentLength = end - start + 1;
   const headers = {
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'no-store',
     'Content-Type': 'application/octet-stream',
-    'Content-Length': end - start + 1,
+    'Content-Length': responseContentLength,
     'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(packagePath))}`,
   };
-  if (range) {
-    headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
-    response.writeHead(206, headers);
-  } else {
-    response.writeHead(200, headers);
-  }
+  const statusCode = range ? 206 : 200;
+  if (range) headers['Content-Range'] = `bytes ${start}-${end}/${stat.size}`;
+  response.writeHead(statusCode, headers);
+  log('info', 'Package response started', {
+    ...packageDetails,
+    statusCode,
+    start,
+    end,
+    contentLength: responseContentLength,
+    totalSize: stat.size,
+  });
   if (request.method === 'HEAD') {
     response.end();
     return;
   }
   const stream = fs.createReadStream(packagePath, { start, end });
-  request.on('aborted', () => stream.destroy());
-  stream.on('error', () => {
+  request.on('aborted', () => {
+    log('warn', 'Package request aborted by client', { ...packageDetails, durationMs: Date.now() - startedAt });
+    stream.destroy();
+  });
+  stream.on('error', (error) => {
+    log('error', 'Package stream failed', { ...packageDetails, error: error.message, code: error.code, durationMs: Date.now() - startedAt });
     if (!response.headersSent) response.writeHead(500);
     response.destroy();
   });
@@ -912,17 +1104,29 @@ async function handleApi(request, response, url) {
       log(reachable ? 'info' : 'warn', 'PS4 connection test completed', {
         reachable,
         statusCode: result.statusCode,
+        diagnostics: result.diagnostics,
         response: result.body,
       });
       return sendJson(response, reachable ? 200 : 502, {
         ok: reachable,
         statusCode: result.statusCode,
+        diagnostics: result.diagnostics,
         response: result.body,
         message: reachable ? 'PS4 Remote Package Installer responded.' : 'The PS4 did not accept the request.',
       });
     } catch (error) {
-      log('error', 'PS4 connection test failed', { code: error.code, error: error.message });
-      return sendError(response, 502, error.message || 'The PS4 could not be reached.');
+      log('error', 'PS4 connection test failed', {
+        code: error.code,
+        phase: error.phase,
+        target: error.target,
+        diagnostics: error.diagnostics,
+        error: error.message,
+      });
+      return sendError(response, 502, error.message || 'The PS4 could not be reached.', {
+        target: error.target,
+        phase: error.phase,
+        ...(error.diagnostics || {}),
+      });
     }
   }
 
