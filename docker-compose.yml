@@ -1,0 +1,22 @@
+services:
+  pkg-link:
+    build: .
+    container_name: pkg-link
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Use debug while diagnosing PS4 connectivity. Set this to info for a
+      # quieter terminal once the connection is working.
+      LOG_LEVEL: debug
+      # This must be the Docker host's LAN address, not localhost. The PS4
+      # uses it to pull the package after the install request is accepted.
+      PUBLIC_BASE_URL: "http://192.168.1.10:8080"
+      PKG_DIR: /pkg
+      DATA_DIR: /data
+    volumes:
+      # Put .pkg files in ./games. The scanner walks subfolders too.
+      - ./games:/pkg:ro
+      # Keeps the selected folder and PS4 settings across container updates.
+      - ./data:/data
+    # The PS4 and the Docker host need to be reachable on the same LAN.

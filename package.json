@@ -1,0 +1,16 @@
+{
+  "name": "ps4pkg-link",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small web UI and HTTP package host for sending authorized PKG files to a PS4 Remote Package Installer.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

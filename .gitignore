@@ -1,0 +1,6 @@
+node_modules/
+data/
+games/
+.env
+npm-debug.log*
+.DS_Store
